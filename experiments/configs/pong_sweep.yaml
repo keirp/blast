@@ -1,0 +1,19 @@
+name: dv2_pong_sweep
+entity: model-pretraining
+project: blast
+command: python dreamerv2/train.py --configs defaults atari
+hyperparam_sweep:
+  task: 'atari_pong'
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      grad_heads: ['reward', 'discount']
+      kl.balance:
+        values: [1, 0.8]
+baseline:
+  task: 'atari_pong'
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]

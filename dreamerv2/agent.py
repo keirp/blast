@@ -57,7 +57,9 @@ class Agent(common.Module):
   @tf.function
   def train(self, data, state=None):
     metrics = {}
+    self.wm.trainable = True
     state, outputs, mets = self.wm.train(data, state)
+    self.wm.trainable = False
     metrics.update(mets)
     start = outputs['post']
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
@@ -91,8 +93,8 @@ class WorldModel(common.Module):
     self.heads['reward'] = common.MLP([], **config.reward_head)
     if config.pred_discount:
       self.heads['discount'] = common.MLP([], **config.discount_head)
-    for name in config.grad_heads:
-      assert name in self.heads, name
+    # for name in config.grad_heads:
+    #   assert name in self.heads, name
     self.model_opt = common.Optimizer('model', **config.model_opt)
 
   def train(self, data, state=None):

@@ -142,7 +142,6 @@ class TensorBoardOutput:
       print('GIF summaries require ffmpeg in $PATH.', e)
       tf.summary.image(name, video, step)
 
-
 def encode_gif(frames, fps):
   from subprocess import Popen, PIPE
   h, w, c = frames[0].shape

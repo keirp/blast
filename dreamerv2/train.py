@@ -25,6 +25,11 @@ import ruamel.yaml as yaml
 
 import agent
 import common
+import wandb
+from os import path
+
+def get_id_storage_path(log_dir: str) -> str:
+  return f'{log_dir}/wandb_id'
 
 
 def main():
@@ -37,11 +42,39 @@ def main():
     config = config.update(configs[name])
   config = common.Flags(config).parse(remaining)
 
+  override_path = pathlib.Path(config.override_file)
+
+  if override_path != pathlib.Path('/dev/null'):
+    override = yaml.safe_load(override_path.read_text())
+    config = config.update(override)
+
+  if config.logdir == '/dev/null':
+    config = config.update({'logdir': f'~/logdir/{wandb.util.generate_id()}'})
+
   logdir = pathlib.Path(config.logdir).expanduser()
   logdir.mkdir(parents=True, exist_ok=True)
   config.save(logdir / 'config.yaml')
   print(config, '\n')
   print('Logdir', logdir)
+
+  id_storage_path = get_id_storage_path(logdir)
+  if not path.exists(id_storage_path):
+    run = wandb.init(sync_tensorboard=True,
+                     project='blast',
+                     entity='model-pretraining')
+    with open(id_storage_path, 'w+') as run_id_storage_file:
+      run_id_storage_file.write(run.id)
+  else:
+    with open(id_storage_path, 'r') as run_id_storage_file:
+      run_id = run_id_storage_file.read()
+    wandb.init(sync_tensorboard=True,
+               project='blast',
+               entity='model-pretraining',
+               resume=run_id)
+
+  wandb.config.update(config)
+
+  wandb.save(str(logdir / 'variables.pkl'))
 
   import tensorflow as tf
   tf.config.experimental_run_functions_eagerly(not config.jit)
@@ -156,7 +189,9 @@ def main():
   train_agent(next(train_dataset))
   if (logdir / 'variables.pkl').exists():
     agnt.load(logdir / 'variables.pkl')
+    print('Loading agent from checkpoint!')
   else:
+    print('No checkpoint found. Initializing agent!')
     print('Pretrain agent.')
     for _ in range(config.pretrain):
       train_agent(next(train_dataset))

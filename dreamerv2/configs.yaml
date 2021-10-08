@@ -2,6 +2,7 @@ defaults:
 
   # Train Script
   logdir: /dev/null
+  override_file: /dev/null
   seed: 0
   task: dmc_walker_walk
   envs: 1
@@ -149,6 +150,14 @@ dmc_proprio:
   critic_opt.lr: 8e-5
   actor_ent: 1e-4
   kl.free: 1.0
+
+fp32:
+  precision: 32
+
+only_kl:
+  grad_heads: [none]
+  kl.balance: 1.0
+  encoder.norm: 'batch'
 
 debug:
 
