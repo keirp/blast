@@ -117,9 +117,13 @@ class Optimizer(tf.Module):
       metrics[f'{self._name}_loss_scale'] = self._opt.loss_scale
 
     # Distributed sync.
-    context = tf.distribute.get_replica_context()
-    if context:
-      grads = context.all_reduce('mean', grads)
+    # ==== NOTE =====
+    # BLAST does not currently support distributed training.
+    # TODO: fix batchnorm to work with distributed training.
+    
+    # context = tf.distribute.get_replica_context()
+    # if context:
+    #   grads = context.all_reduce('mean', grads)
 
     # Gradient clipping.
     norm = tf.linalg.global_norm(grads)

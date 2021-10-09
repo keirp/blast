@@ -32,7 +32,7 @@ class Agent(common.Module):
       action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
       state = latent, action
     latent, action = state
-    embed = self.wm.encoder(self.wm.preprocess(obs))
+    embed = self.wm.target_encoder(self.wm.preprocess(obs), training=False)
     sample = (mode == 'train') or not self.config.eval_state_mean
     latent, _ = self.wm.rssm.obs_step(
         latent, action, embed, obs['is_first'], sample)
@@ -57,11 +57,9 @@ class Agent(common.Module):
   @tf.function
   def train(self, data, state=None):
     metrics = {}
-    self.wm.trainable = True
     state, outputs, mets = self.wm.train(data, state)
-    self.wm.trainable = False
     metrics.update(mets)
-    start = outputs['post']
+    start = outputs['target_posts']
     reward = lambda seq: self.wm.heads['reward'](seq['feat']).mode()
     metrics.update(self._task_behavior.train(
         self.wm, start, data['is_terminal'], reward))
@@ -88,6 +86,11 @@ class WorldModel(common.Module):
     self.tfstep = tfstep
     self.rssm = common.EnsembleRSSM(**config.rssm)
     self.encoder = common.Encoder(shapes, **config.encoder)
+    if self.config.use_target:
+      # self._target_rssm = common.EnsembleRSSM(**config.rssm)
+      self.target_encoder = common.Encoder(shapes, **config.encoder)
+    else:
+      self.target_encoder = self.encoder
     self.heads = {}
     self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
     self.heads['reward'] = common.MLP([], **config.reward_head)
@@ -96,20 +99,39 @@ class WorldModel(common.Module):
     # for name in config.grad_heads:
     #   assert name in self.heads, name
     self.model_opt = common.Optimizer('model', **config.model_opt)
+    self._updates = tf.Variable(0, tf.int64)
 
   def train(self, data, state=None):
     with tf.GradientTape() as model_tape:
       model_loss, state, outputs, metrics = self.loss(data, state)
     modules = [self.encoder, self.rssm, *self.heads.values()]
     metrics.update(self.model_opt(model_tape, model_loss, modules))
+    self.update_targets()
     return state, outputs, metrics
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
-    embed = self.encoder(data)
+
+    if self.config.use_target:
+      target_embed = self.target_encoder(data, training=True)
+      target_post, target_prior = self.rssm.observe(
+          target_embed, data['action'], data['is_first'], state, training=True)
+
+    embed = self.encoder(data, training=True)
+
+    if self.config.use_target:
+      n_online = int(target_embed.shape[0] * (1 - self.config.target_input_p))
+      embed = tf.concat((embed[:n_online], target_embed[n_online:]), axis=0)
+
     post, prior = self.rssm.observe(
-        embed, data['action'], data['is_first'], state)
-    kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
+        embed, data['action'], data['is_first'], state, training=True)
+
+    if self.config.use_target:
+      sg = lambda x: tf.nest.map_structure(tf.stop_gradient, x)
+      kl_loss, kl_value = self.rssm.kl_loss(sg(target_post), prior, **self.config.kl)
+    else:
+      target_post = post
+      kl_loss, kl_value = self.rssm.kl_loss(target_post, prior, **self.config.kl)
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
@@ -127,7 +149,8 @@ class WorldModel(common.Module):
         self.config.loss_scales.get(k, 1.0) * v for k, v in losses.items())
     outs = dict(
         embed=embed, feat=feat, post=post,
-        prior=prior, likes=likes, kl=kl_value)
+        prior=prior, likes=likes, kl=kl_value,
+        target_posts=target_post)
     metrics = {f'{name}_loss': value for name, value in losses.items()}
     metrics['model_kl'] = kl_value.mean()
     metrics['prior_ent'] = self.rssm.get_dist(prior).entropy().mean()
@@ -190,9 +213,9 @@ class WorldModel(common.Module):
   def video_pred(self, data, key):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
-    embed = self.encoder(data)
+    embed = self.target_encoder(data, training=False)
     states, _ = self.rssm.observe(
-        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5])
+        embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5], training=False)
     recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
     init = {k: v[:, -1] for k, v in states.items()}
     prior = self.rssm.imagine(data['action'][:6, 5:], init)
@@ -203,6 +226,13 @@ class WorldModel(common.Module):
     B, T, H, W, C = video.shape
     return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
 
+  def update_targets(self):
+    if self.config.use_target:
+      mix = 1.0 if self._updates == 0 else float(
+          self.config.target_ema)
+      for s, d in zip(self.encoder.variables, self.target_encoder.variables):
+        d.assign(mix * d + (1 - mix) * s)
+      self._updates.assign_add(1)
 
 class ActorCritic(common.Module):
 

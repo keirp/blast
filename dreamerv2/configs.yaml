@@ -40,7 +40,7 @@ defaults:
   # World Model
   grad_heads: [decoder, reward, discount]
   pred_discount: True
-  rssm: {ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, std_act: sigmoid2, min_std: 0.1}
+  rssm: {ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, obs_out_norm: none, std_act: sigmoid2, min_std: 0.1}
   encoder: {mlp_keys: '.*', cnn_keys: '.*', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [4, 4, 4, 4], mlp_layers: [400, 400, 400, 400]}
   decoder: {mlp_keys: '.*', cnn_keys: '.*', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [5, 5, 6, 6], mlp_layers: [400, 400, 400, 400]}
   reward_head: {layers: 4, units: 400, act: elu, norm: none, dist: mse}
@@ -48,6 +48,9 @@ defaults:
   loss_scales: {kl: 1.0, reward: 1.0, discount: 1.0, proprio: 1.0}
   kl: {free: 0.0, forward: False, balance: 0.8, free_avg: True}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6}
+  use_target: False
+  target_ema: 1.0
+  target_input_p: 0.0
 
   # Actor Critic
   actor: {layers: 4, units: 400, act: elu, norm: none, dist: auto, min_std: 0.1}
@@ -158,6 +161,10 @@ only_kl:
   grad_heads: [none]
   kl.balance: 1.0
   encoder.norm: 'batch'
+  rssm.obs_out_norm: 'batch'
+  target_ema: 0.99
+  use_target: True
+  target_input_p: 0.8
 
 debug:
 
@@ -169,4 +176,4 @@ debug:
   pretrain: 1
   train_steps: 1
   replay: {minlen: 10, maxlen: 30}
-  dataset: {batch: 10, length: 10}
+  dataset: {batch: 16, length: 10}

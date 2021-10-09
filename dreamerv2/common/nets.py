@@ -13,7 +13,7 @@ class EnsembleRSSM(common.Module):
 
   def __init__(
       self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-      act='elu', norm='none', std_act='softplus', min_std=0.1):
+      act='elu', norm='none', obs_out_norm='none', std_act='softplus', min_std=0.1):
     super().__init__()
     self._ensemble = ensemble
     self._stoch = stoch
@@ -22,6 +22,7 @@ class EnsembleRSSM(common.Module):
     self._discrete = discrete
     self._act = get_act(act)
     self._norm = norm
+    self._obs_out_norm = obs_out_norm
     self._std_act = std_act
     self._min_std = min_std
     self._cell = GRUCell(self._deter, norm=True)
@@ -43,12 +44,12 @@ class EnsembleRSSM(common.Module):
     return state
 
   @tf.function
-  def observe(self, embed, action, is_first, state=None):
+  def observe(self, embed, action, is_first, state=None, training=True):
     swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
     if state is None:
       state = self.initial(tf.shape(action)[0])
     post, prior = common.static_scan(
-        lambda prev, inputs: self.obs_step(prev[0], *inputs),
+        lambda prev, inputs: self.obs_step(prev[0], *inputs, training=training),
         (swap(action), swap(embed), swap(is_first)), (state, state))
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
@@ -87,7 +88,7 @@ class EnsembleRSSM(common.Module):
     return dist
 
   @tf.function
-  def obs_step(self, prev_state, prev_action, embed, is_first, sample=True):
+  def obs_step(self, prev_state, prev_action, embed, is_first, sample=True, training=True):
     # if is_first.any():
     prev_state, prev_action = tf.nest.map_structure(
         lambda x: tf.einsum(
@@ -96,7 +97,7 @@ class EnsembleRSSM(common.Module):
     prior = self.img_step(prev_state, prev_action, sample)
     x = tf.concat([prior['deter'], embed], -1)
     x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
-    x = self.get('obs_out_norm', NormLayer, self._norm)(x)
+    x = self.get('obs_out_norm', NormLayer, self._obs_out_norm)(x, training=training)
     x = self._act(x)
     stats = self._suff_stats_layer('obs_dist', x)
     dist = self.get_dist(stats)
@@ -199,7 +200,7 @@ class Encoder(common.Module):
     self._mlp_layers = mlp_layers
 
   @tf.function
-  def __call__(self, data):
+  def __call__(self, data, training=True):
     key, shape = list(self.shapes.items())[0]
     batch_dims = data[key].shape[:-len(shape)]
     data = {
@@ -207,28 +208,28 @@ class Encoder(common.Module):
         for k, v in data.items()}
     outputs = []
     if self.cnn_keys:
-      outputs.append(self._cnn({k: data[k] for k in self.cnn_keys}))
+      outputs.append(self._cnn({k: data[k] for k in self.cnn_keys}, training=training))
     if self.mlp_keys:
-      outputs.append(self._mlp({k: data[k] for k in self.mlp_keys}))
+      outputs.append(self._mlp({k: data[k] for k in self.mlp_keys}, training=training))
     output = tf.concat(outputs, -1)
     return output.reshape(batch_dims + output.shape[1:])
 
-  def _cnn(self, data):
+  def _cnn(self, data, training=True):
     x = tf.concat(list(data.values()), -1)
     x = x.astype(prec.global_policy().compute_dtype)
     for i, kernel in enumerate(self._cnn_kernels):
       depth = 2 ** i * self._cnn_depth
       x = self.get(f'conv{i}', tfkl.Conv2D, depth, kernel, 2)(x)
-      x = self.get(f'convnorm{i}', NormLayer, self._norm)(x)
+      x = self.get(f'convnorm{i}', NormLayer, self._norm)(x, training=training)
       x = self._act(x)
     return x.reshape(tuple(x.shape[:-3]) + (-1,))
 
-  def _mlp(self, data):
+  def _mlp(self, data, training=True):
     x = tf.concat(list(data.values()), -1)
     x = x.astype(prec.global_policy().compute_dtype)
     for i, width in enumerate(self._mlp_layers):
       x = self.get(f'dense{i}', tfkl.Dense, width)(x)
-      x = self.get(f'densenorm{i}', NormLayer, self._norm)(x)
+      x = self.get(f'densenorm{i}', NormLayer, self._norm)(x, training=training)
       x = self._act(x)
     return x
 
@@ -251,16 +252,16 @@ class Decoder(common.Module):
     self._cnn_kernels = cnn_kernels
     self._mlp_layers = mlp_layers
 
-  def __call__(self, features):
+  def __call__(self, features, training=True):
     features = tf.cast(features, prec.global_policy().compute_dtype)
     outputs = {}
     if self.cnn_keys:
-      outputs.update(self._cnn(features))
+      outputs.update(self._cnn(features, training=training))
     if self.mlp_keys:
-      outputs.update(self._mlp(features))
+      outputs.update(self._mlp(features, training=training))
     return outputs
 
-  def _cnn(self, features):
+  def _cnn(self, features, training=True):
     channels = {k: self._shapes[k][-1] for k in self.cnn_keys}
     ConvT = tfkl.Conv2DTranspose
     x = self.get('convin', tfkl.Dense, 32 * self._cnn_depth)(features)
@@ -271,7 +272,7 @@ class Decoder(common.Module):
       if i == len(self._cnn_kernels) - 1:
         depth, act, norm = sum(channels.values()), tf.identity, 'none'
       x = self.get(f'conv{i}', ConvT, depth, kernel, 2)(x)
-      x = self.get(f'convnorm{i}', NormLayer, norm)(x)
+      x = self.get(f'convnorm{i}', NormLayer, norm)(x, training=training)
       x = act(x)
     x = x.reshape(features.shape[:-1] + x.shape[1:])
     means = tf.split(x, list(channels.values()), -1)
@@ -280,12 +281,12 @@ class Decoder(common.Module):
         for (key, shape), mean in zip(channels.items(), means)}
     return dists
 
-  def _mlp(self, features):
+  def _mlp(self, features, training=True):
     shapes = {k: self._shapes[k] for k in self.mlp_keys}
     x = features
     for i, width in enumerate(self._mlp_layers):
       x = self.get(f'dense{i}', tfkl.Dense, width)(x)
-      x = self.get(f'densenorm{i}', NormLayer, self._norm)(x)
+      x = self.get(f'densenorm{i}', NormLayer, self._norm)(x, training=training)
       x = self._act(x)
     dists = {}
     for key, shape in shapes.items():
@@ -303,12 +304,12 @@ class MLP(common.Module):
     self._act = get_act(act)
     self._out = out
 
-  def __call__(self, features):
+  def __call__(self, features, training=True):
     x = tf.cast(features, prec.global_policy().compute_dtype)
     x = x.reshape([-1, x.shape[-1]])
     for index in range(self._layers):
       x = self.get(f'dense{index}', tfkl.Dense, self._units)(x)
-      x = self.get(f'norm{index}', NormLayer, self._norm)(x)
+      x = self.get(f'norm{index}', NormLayer, self._norm)(x, training=training)
       x = self._act(x)
     x = x.reshape(features.shape[:-1] + [x.shape[-1]])
     return self.get('out', DistLayer, self._shape, **self._out)(x)
@@ -392,6 +393,7 @@ class DistLayer(common.Module):
 class NormLayer(common.Module):
 
   def __init__(self, name):
+    self._layer_name = name
     if name == 'none':
       self._layer = None
     elif name == 'layer':
@@ -401,9 +403,11 @@ class NormLayer(common.Module):
     else:
       raise NotImplementedError(name)
 
-  def __call__(self, features):
+  def __call__(self, features, training=True):
     if not self._layer:
       return features
+    if self._layer_name == 'batch':
+      return self._layer(features, training=training)
     return self._layer(features)
 
 

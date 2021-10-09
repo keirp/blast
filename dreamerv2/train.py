@@ -50,6 +50,7 @@ def main():
 
   if config.logdir == '/dev/null':
     config = config.update({'logdir': f'~/logdir/{wandb.util.generate_id()}'})
+    print(f'Creating logdir: {config.logdir}')
 
   logdir = pathlib.Path(config.logdir).expanduser()
   logdir.mkdir(parents=True, exist_ok=True)
