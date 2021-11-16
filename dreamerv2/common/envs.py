@@ -73,7 +73,7 @@ class GymWrapper:
 class DMC:
 
   def __init__(self, name, action_repeat=1, size=(64, 64), camera=None):
-    os.environ['MUJOCO_GL'] = 'egl'
+    # os.environ['MUJOCO_GL'] = 'egl'
     domain, task = name.split('_', 1)
     if domain == 'cup':  # Only domain with multiple words.
       domain = 'ball_in_cup'
@@ -637,3 +637,112 @@ class Async:
         conn.close()
       except IOError:
         pass  # The connection was already closed.
+
+### MiniGrid Envs ###
+
+import gym_minigrid
+from gym_minigrid.wrappers import RGBImgObsWrapper, ImgObsWrapper
+import cv2
+
+class Repeat(gym.Wrapper):
+    def step(self, action):
+        obs, reward, done, info = self.env.step(action)
+        if done:
+            obs = self.env.reset()
+        return obs, reward, False, info
+
+class LimitDiscreteActions(gym.core.ActionWrapper):
+  """
+      Select a subset of discrete actions
+  """
+  def __init__(self, env, num_actions):
+    assert isinstance(env.action_space, gym.spaces.Discrete)
+    super().__init__(env)
+    self.action_space = gym.spaces.Discrete(num_actions)
+    self.num_actions = num_actions
+
+  def action(self, action: int) -> int:
+    assert action < self.num_actions
+    return action
+
+  def reverse_action(self, action: int) -> int:
+    assert action < self.num_actions
+    return action
+
+
+class ResizeObs(gym.core.ObservationWrapper):
+  """Resize the image provided as observations by an environment"""
+  def __init__(self, env, new_size=(64, 64)):
+    super().__init__(env)
+    assert isinstance(env.observation_space, gym.spaces.Box)
+    old_shape = env.observation_space.shape
+    assert len(env.observation_space.shape) == 3
+    assert env.observation_space.dtype == np.uint8
+    assert (env.observation_space.low == 0).all()
+    assert (env.observation_space.high == 255).all()
+
+    self.observation_space = gym.spaces.Box(low=0,
+                                  high=255,
+                                  shape=(new_size + (old_shape[2],)),
+                                  dtype=np.uint8)
+    self.new_size = new_size
+
+  def observation(self, observation: np.ndarray) -> np.ndarray:
+      return cv2.resize(observation, dsize=self.new_size, interpolation=cv2.INTER_NEAREST)
+
+def wrap_nav_grid_world(env, image_size=(64, 64)):
+  env = RGBImgObsWrapper(env)
+  env = ImgObsWrapper(env)
+  env = ResizeObs(env, image_size)
+  env = LimitDiscreteActions(env, 3) # limit action to just movement
+  return env
+
+class MiniGridEnv():
+  def __init__(self, name, image_size) -> None:
+    env = gym.make(name)
+    env = wrap_nav_grid_world(env, image_size)
+    env = Repeat(env)
+    self._env = env
+    self._image_size = image_size
+
+  @property
+  def observation_space(self):
+    image = gym.spaces.Box(0, 255, self._image_size + (3,), dtype=np.uint8)
+    return gym.spaces.Dict({'image': image})
+  
+  @property
+  def action_space(self):
+    action = gym.spaces.Discrete(3)
+    return gym.spaces.Dict({'action': action})
+
+  def reset(self):
+    img = self._env.reset()
+    return {'image': img}
+
+  def step(self, action):
+    img, reward, done, info = self._env.step(action['action'])
+    return {'image': img}, float(reward), done, info
+
+
+from common.wrappers.natural_env import ReplaceBackgroundEnv
+from common.wrappers.imgsource import *
+from common.wrappers.matting import BackgroundMattingWithColor
+from pathlib import Path
+import glob
+
+dir_path = Path(__file__).parent.absolute()
+ALL_VIDEOS = glob.glob(f'{dir_path}/wrappers/videos/*.mp4')
+FIXED_VIDEO = [f'{dir_path}/wrappers/videos/0njsyMX-sz4_000000_000010.mp4']
+
+class MiniGridVideoDistractionEnv(MiniGridEnv):
+  def __init__(self, name, image_size, videos=ALL_VIDEOS, play_mode='play') -> None:
+    env = gym.make(name)
+    env = wrap_nav_grid_world(env, image_size)
+    env = Repeat(env)
+    shape2d = env.observation_space.shape[:2]
+    imgsource = RandomVideoSource(shape2d, videos, mode=play_mode)
+    env = ReplaceBackgroundEnv(
+      env, BackgroundMattingWithColor((0, 0, 0)), imgsource
+    )
+    self._env = env
+    self._image_size = image_size

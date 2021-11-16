@@ -1,0 +1,11 @@
+name: dv2_baselines
+entity: model-pretraining
+project: blast
+command: python dreamerv2/train.py --configs defaults atari
+with_bn:
+  task: 
+    values: ['atari_pong', 'atari_breakout', 'atari_seaquest']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2]

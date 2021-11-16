@@ -1,0 +1,21 @@
+name: blast_reward
+entity: model-pretraining
+project: blast
+command: python dreamerv2/train.py --configs defaults atari only_kl
+with_bn:
+  task: 
+    values: ['atari_breakout', 'atari_seaquest', 'atari_qbert']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2]
+      rssm.ar_steps: 
+        values: [1]
+      use_target_encoder: True
+      use_target_rssm:
+        values: [True, False]
+      rssm.stoch:
+        values: [8, 16]
+      rssm.discrete: 
+        values: [32, 64]
+      grad_heads: ['reward', 'discount']

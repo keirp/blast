@@ -61,6 +61,8 @@ class Module(tf.Module):
       self._modules[name] = ctor(*args, **kwargs)
     return self._modules[name]
 
+  def get_vars_dict(self):
+    return {name: list(self._modules[name].variables) for name in self._modules}
 
 class Optimizer(tf.Module):
 

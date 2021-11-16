@@ -1,0 +1,121 @@
+name: dmc_exps
+entity: model-pretraining
+project: blast
+command: xvfb-run -a -s "-screen 0 1400x900x24" python dreamerv2/train.py --configs defaults dmc_vision
+dv2:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      tag: 'dv2'
+no_recon:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      grad_heads: [reward]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      tag: 'no_recon'
+stop_grad:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      grad_heads: [reward]
+      kl.balance: 1.0
+      tag: 'stop_grad'
+target:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      grad_heads: [reward]
+      kl.balance: 1.0
+      use_target_encoder: True
+      use_target_rssm: False
+      target_ema: 0.99
+      target_input_p: 0.5
+      tag: 'target'
+bn:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      grad_heads: [reward]
+      kl.balance: 1.0
+      use_target_encoder: True
+      use_target_rssm: False
+      target_ema: 0.99
+      target_input_p: 0.5
+      encoder.norm: 'batch'
+      rssm.obs_out_norm: 'batch'
+      tag: 'bn'
+ar_prior:
+  task: 
+    values: ['dmc_cartpole_swingup',
+             'dmc_cheetah_run',
+             'dmc_cup_catch',
+             'dmc_hopper_hop',
+             'dmc_pendulum_swingup',
+             'dmc_walker_run']
+
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2, 3]
+      rssm.stoch: 8
+      rssm.discrete: 64
+      grad_heads: [reward]
+      kl.balance: 1.0
+      use_target_encoder: True
+      use_target_rssm: False
+      target_ema: 0.99
+      target_input_p: 0.5
+      encoder.norm: 'batch'
+      rssm.obs_out_norm: 'batch'
+      rssm.ar_steps: 8
+      tag: 'ar_prior'

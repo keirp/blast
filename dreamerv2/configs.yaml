@@ -5,6 +5,7 @@ defaults:
   override_file: /dev/null
   seed: 0
   task: dmc_walker_walk
+  tag: none
   envs: 1
   envs_parallel: none
   render_size: [64, 64]
@@ -29,6 +30,7 @@ defaults:
   log_keys_max: '^$'
   precision: 16
   jit: True
+  image_size: [64, 64]
 
   # Agent
   clip_rewards: tanh
@@ -40,7 +42,7 @@ defaults:
   # World Model
   grad_heads: [decoder, reward, discount]
   pred_discount: True
-  rssm: {ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, act: elu, norm: none, obs_out_norm: none, std_act: sigmoid2, min_std: 0.1}
+  rssm: {ensemble: 1, hidden: 1024, deter: 1024, stoch: 32, discrete: 32, ar_steps: 1, act: elu, norm: none, obs_out_norm: none, std_act: sigmoid2, min_std: 0.1, img_mlp: False}
   encoder: {mlp_keys: '.*', cnn_keys: '.*', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [4, 4, 4, 4], mlp_layers: [400, 400, 400, 400]}
   decoder: {mlp_keys: '.*', cnn_keys: '.*', act: elu, norm: none, cnn_depth: 48, cnn_kernels: [5, 5, 6, 6], mlp_layers: [400, 400, 400, 400]}
   reward_head: {layers: 4, units: 400, act: elu, norm: none, dist: mse}
@@ -48,7 +50,8 @@ defaults:
   loss_scales: {kl: 1.0, reward: 1.0, discount: 1.0, proprio: 1.0}
   kl: {free: 0.0, forward: False, balance: 0.8, free_avg: True}
   model_opt: {opt: adam, lr: 1e-4, eps: 1e-5, clip: 100, wd: 1e-6}
-  use_target: False
+  use_target_encoder: False
+  use_target_rssm: False
   target_ema: 1.0
   target_input_p: 0.0
 
@@ -133,6 +136,7 @@ dmc_vision:
   critic_opt.lr: 8e-5
   actor_ent: 1e-4
   kl.free: 1.0
+  steps: 1e6
 
 dmc_proprio:
 
@@ -154,6 +158,29 @@ dmc_proprio:
   actor_ent: 1e-4
   kl.free: 1.0
 
+minigrid-repeat:
+  time_limit: 108000  # 30 minutes of game play.
+  action_repeat: 1
+  eval_every: 2500
+  eval_eps: 5
+  train_every: 1
+  steps: 5e4
+  prefill: 10000
+  pred_discount: False
+  grad_heads: [decoder, reward]
+  rssm: {hidden: 600, deter: 600, stoch: 32, discrete: 32}
+  actor.dist: onehot
+  model_opt.lr: 4e-4
+  actor_opt.lr: 8e-5
+  critic_opt.lr: 1e-4
+  actor_ent: 0.1
+  discount: 0.99
+  actor_grad: reinforce
+  actor_grad_mix: 0
+  loss_scales.kl: 0.1
+  loss_scales.reward: 100.0
+  .*\.wd$: 1e-6
+
 fp32:
   precision: 32
 
@@ -163,8 +190,12 @@ only_kl:
   encoder.norm: 'batch'
   rssm.obs_out_norm: 'batch'
   target_ema: 0.99
-  use_target: True
-  target_input_p: 0.8
+  target_input_p: 0.5
+  rssm.ar_steps: 8
+  use_target_encoder: True
+  use_target_rssm: False
+  rssm.stoch: 16
+  rssm.discrete: 64
 
 debug:
 

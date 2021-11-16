@@ -28,15 +28,15 @@ class Agent(common.Module):
     tf.py_function(lambda: self.tfstep.assign(
         int(self.step), read_value=False), [], [])
     if state is None:
-      latent = self.wm.rssm.initial(len(obs['reward']))
+      latent = self.wm.target_rssm.initial(len(obs['reward']))
       action = tf.zeros((len(obs['reward']),) + self.act_space.shape)
       state = latent, action
     latent, action = state
     embed = self.wm.target_encoder(self.wm.preprocess(obs), training=False)
     sample = (mode == 'train') or not self.config.eval_state_mean
-    latent, _ = self.wm.rssm.obs_step(
-        latent, action, embed, obs['is_first'], sample)
-    feat = self.wm.rssm.get_feat(latent)
+    latent, _ = self.wm.target_rssm.obs_step(
+        latent, action, embed, obs['is_first'], None, sample, training=False)
+    feat = self.wm.target_rssm.get_feat(latent)
     if mode == 'eval':
       actor = self._task_behavior.actor(feat)
       action = actor.mode()
@@ -86,11 +86,14 @@ class WorldModel(common.Module):
     self.tfstep = tfstep
     self.rssm = common.EnsembleRSSM(**config.rssm)
     self.encoder = common.Encoder(shapes, **config.encoder)
-    if self.config.use_target:
-      # self._target_rssm = common.EnsembleRSSM(**config.rssm)
+    if self.config.use_target_encoder:
       self.target_encoder = common.Encoder(shapes, **config.encoder)
     else:
       self.target_encoder = self.encoder
+    if self.config.use_target_rssm:
+      self.target_rssm = common.EnsembleRSSM(**config.rssm)
+    else:
+      self.target_rssm = self.rssm
     self.heads = {}
     self.heads['decoder'] = common.Decoder(shapes, **config.decoder)
     self.heads['reward'] = common.MLP([], **config.reward_head)
@@ -111,27 +114,45 @@ class WorldModel(common.Module):
 
   def loss(self, data, state=None):
     data = self.preprocess(data)
+    sg = lambda x: tf.nest.map_structure(tf.stop_gradient, x)
 
-    if self.config.use_target:
+    if self.config.use_target_encoder or self.config.use_target_rssm:
+
+      # get obs embeddings from both online and target encoders
       target_embed = self.target_encoder(data, training=True)
-      target_post, target_prior = self.rssm.observe(
+      embed = self.encoder(data, training=True)
+
+      # get target_post from target_embed using target_rssm
+      target_post = self.target_rssm.post(
           target_embed, data['action'], data['is_first'], state, training=True)
 
-    embed = self.encoder(data, training=True)
-
-    if self.config.use_target:
-      n_online = int(target_embed.shape[0] * (1 - self.config.target_input_p))
-      embed = tf.concat((embed[:n_online], target_embed[n_online:]), axis=0)
-
-    post, prior = self.rssm.observe(
+      # get post from online embeddings using online rssm
+      post = self.rssm.post(
         embed, data['action'], data['is_first'], state, training=True)
 
-    if self.config.use_target:
-      sg = lambda x: tf.nest.map_structure(tf.stop_gradient, x)
+      n_online = int(target_embed.shape[0] * (1 - self.config.target_input_p))
+
+      # set a percentage of deter to online and some to target from the computed posts
+      combine = lambda online, target: tf.concat((online[:n_online], target[n_online:]), axis=0)
+      post = {k: combine(post[k], target_post[k]) for k, v in post.items()}
+      deter = post['deter']
+
+      teacher_forcing = sg(target_post['stoch'])
+      prior = self.rssm.prior(deter, teacher_forcing=teacher_forcing)
+
+      if self._updates == 0:
+        _ = self.target_rssm.prior(deter, teacher_forcing=teacher_forcing)
+
       kl_loss, kl_value = self.rssm.kl_loss(sg(target_post), prior, **self.config.kl)
     else:
+      embed = self.encoder(data, training=True)
+
+      post, prior = self.rssm.observe(
+        embed, data['action'], data['is_first'], state, training=True)
       target_post = post
-      kl_loss, kl_value = self.rssm.kl_loss(target_post, prior, **self.config.kl)
+
+      kl_loss, kl_value = self.rssm.kl_loss(post, prior, **self.config.kl)
+
     assert len(kl_loss.shape) == 0
     likes = {}
     losses = {'kl': kl_loss}
@@ -161,13 +182,13 @@ class WorldModel(common.Module):
   def imagine(self, policy, start, is_terminal, horizon):
     flatten = lambda x: x.reshape([-1] + list(x.shape[2:]))
     start = {k: flatten(v) for k, v in start.items()}
-    start['feat'] = self.rssm.get_feat(start)
+    start['feat'] = self.target_rssm.get_feat(start)
     start['action'] = tf.zeros_like(policy(start['feat']).mode())
     seq = {k: [v] for k, v in start.items()}
     for _ in range(horizon):
       action = policy(tf.stop_gradient(seq['feat'][-1])).sample()
-      state = self.rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
-      feat = self.rssm.get_feat(state)
+      state = self.target_rssm.img_step({k: v[-1] for k, v in seq.items()}, action)
+      feat = self.target_rssm.get_feat(state)
       for key, value in {**state, 'action': action, 'feat': feat}.items():
         seq[key].append(value)
     seq = {k: tf.stack(v, 0) for k, v in seq.items()}
@@ -214,12 +235,12 @@ class WorldModel(common.Module):
     decoder = self.heads['decoder']
     truth = data[key][:6] + 0.5
     embed = self.target_encoder(data, training=False)
-    states, _ = self.rssm.observe(
+    states, _ = self.target_rssm.observe(
         embed[:6, :5], data['action'][:6, :5], data['is_first'][:6, :5], training=False)
-    recon = decoder(self.rssm.get_feat(states))[key].mode()[:6]
+    recon = decoder(self.target_rssm.get_feat(states))[key].mode()[:6]
     init = {k: v[:, -1] for k, v in states.items()}
-    prior = self.rssm.imagine(data['action'][:6, 5:], init)
-    openl = decoder(self.rssm.get_feat(prior))[key].mode()
+    prior = self.target_rssm.imagine(data['action'][:6, 5:], init)
+    openl = decoder(self.target_rssm.get_feat(prior))[key].mode()
     model = tf.concat([recon[:, :5] + 0.5, openl + 0.5], 1)
     error = (model - truth + 1) / 2
     video = tf.concat([truth, model, error], 2)
@@ -227,12 +248,30 @@ class WorldModel(common.Module):
     return video.transpose((1, 2, 0, 3, 4)).reshape((T, H, B * W, C))
 
   def update_targets(self):
-    if self.config.use_target:
-      mix = 1.0 if self._updates == 0 else float(
+    mix = 1.0 if self._updates == 0 else float(
           self.config.target_ema)
+    if self.config.use_target_encoder:
       for s, d in zip(self.encoder.variables, self.target_encoder.variables):
-        d.assign(mix * d + (1 - mix) * s)
-      self._updates.assign_add(1)
+        if 'moving' not in d.name:
+          d.assign(mix * d + (1 - mix) * s)
+
+    if self.config.use_target_rssm:
+      # set img vars to online
+      online_dict = self.rssm.get_vars_dict()
+      target_dict = self.target_rssm.get_vars_dict()
+
+
+      for name in online_dict:
+        online_vars = online_dict[name]
+        target_vars = target_dict[name]
+        for s, d in zip(online_vars, target_vars):
+          if 'img' in name:
+            d.assign(s)
+          else:
+            if 'moving' not in d.name:
+              d.assign(mix * d + (1 - mix) * s)
+
+    self._updates.assign_add(1)
 
 class ActorCritic(common.Module):
 

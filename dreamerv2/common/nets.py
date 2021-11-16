@@ -12,8 +12,8 @@ import common
 class EnsembleRSSM(common.Module):
 
   def __init__(
-      self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False,
-      act='elu', norm='none', obs_out_norm='none', std_act='softplus', min_std=0.1):
+      self, ensemble=5, stoch=30, deter=200, hidden=200, discrete=False, ar_steps=1,
+      act='elu', norm='none', obs_out_norm='none', std_act='softplus', min_std=0.1, img_mlp=False):
     super().__init__()
     self._ensemble = ensemble
     self._stoch = stoch
@@ -25,7 +25,14 @@ class EnsembleRSSM(common.Module):
     self._obs_out_norm = obs_out_norm
     self._std_act = std_act
     self._min_std = min_std
-    self._cell = GRUCell(self._deter, norm=True)
+    self.ar_steps = ar_steps
+    self.stoch_per_step = int(stoch / ar_steps) # better be evenly divisible
+    self.img_mlp = img_mlp
+    # self._cell = GRUCell(self._deter, norm=True)
+    # self._modules['cell'] = self._cell
+    # if ar_steps > 1:
+    #   self._ar_cell = GRUCell(self._deter, norm=True)
+    #   self._modules['ar_cell'] = self._ar_cell
     self._cast = lambda x: tf.cast(x, prec.global_policy().compute_dtype)
 
   def initial(self, batch_size):
@@ -34,26 +41,51 @@ class EnsembleRSSM(common.Module):
       state = dict(
           logit=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
           stoch=tf.zeros([batch_size, self._stoch, self._discrete], dtype),
-          deter=self._cell.get_initial_state(None, batch_size, dtype))
+          deter=self.get('cell', GRUCell, self._deter, norm=True).get_initial_state(None, batch_size, dtype))
     else:
       state = dict(
           mean=tf.zeros([batch_size, self._stoch], dtype),
           std=tf.zeros([batch_size, self._stoch], dtype),
           stoch=tf.zeros([batch_size, self._stoch], dtype),
-          deter=self._cell.get_initial_state(None, batch_size, dtype))
+          deter=self.get('cell', GRUCell, self._deter, norm=True).get_initial_state(None, batch_size, dtype))
     return state
 
   @tf.function
-  def observe(self, embed, action, is_first, state=None, training=True):
+  def observe(self, embed, action, is_first, state=None, training=False, teacher_forcing=None):
     swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
     if state is None:
       state = self.initial(tf.shape(action)[0])
-    post, prior = common.static_scan(
-        lambda prev, inputs: self.obs_step(prev[0], *inputs, training=training),
-        (swap(action), swap(embed), swap(is_first)), (state, state))
+    if teacher_forcing is None:
+      post, prior = common.static_scan(
+          lambda prev, inputs: self.obs_step(prev[0], *inputs, None, training=training),
+          (swap(action), swap(embed), swap(is_first)), (state, state))
+    else:
+      post, prior = common.static_scan(
+          lambda prev, inputs: self.obs_step(prev[0], *inputs, training=training),
+          (swap(action), swap(embed), swap(is_first), swap(teacher_forcing)), (state, state))
     post = {k: swap(v) for k, v in post.items()}
     prior = {k: swap(v) for k, v in prior.items()}
     return post, prior
+
+  @tf.function
+  def post(self, embed, action, is_first, state=None, training=False):
+    swap = lambda x: tf.transpose(x, [1, 0] + list(range(2, len(x.shape))))
+    if state is None:
+      state = self.initial(tf.shape(action)[0])
+    post = common.static_scan(
+        lambda prev, inputs: self.post_step(prev, *inputs, training=training),
+        (swap(action), swap(embed), swap(is_first)), state)
+    post = {k: swap(v) for k, v in post.items()}
+    return post
+
+  @tf.function
+  def prior(self, deter, teacher_forcing=None, sample=True):
+    batch_size, t_size = deter.shape[:2]
+    deter = deter.reshape([batch_size * t_size, -1])
+    teacher_forcing = teacher_forcing.reshape([batch_size * t_size] + list(teacher_forcing.shape[2:]))
+    prior = self.prior_step(deter, teacher_forcing, sample)
+    prior = {k: v.reshape([batch_size, t_size] + list(v.shape[1:])) for k, v in prior.items()}
+    return prior
 
   @tf.function
   def imagine(self, action, state=None):
@@ -88,13 +120,115 @@ class EnsembleRSSM(common.Module):
     return dist
 
   @tf.function
-  def obs_step(self, prev_state, prev_action, embed, is_first, sample=True, training=True):
+  def post_step(self, prev_state, prev_action, embed, is_first, sample=True, 
+                training=False):
+    prev_state, prev_action = tf.nest.map_structure(
+        lambda x: tf.einsum(
+            'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
+        (prev_state, prev_action))
+    deter = self.deter_update(prev_state, prev_action)
+    x = tf.concat([deter, embed], -1)
+    x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
+    x = self.get('obs_out_norm', NormLayer, self._obs_out_norm)(x, training=training)
+    x = self._act(x)
+    stats = self._suff_stats_layer('obs_dist', x)
+    dist = self.get_dist(stats)
+    stoch = dist.sample() if sample else dist.mode()
+    post = {'stoch': stoch, 'deter': deter, **stats}
+    return post
+
+  @tf.function
+  def deter_update(self, prev_state, prev_action):
+    prev_stoch = self._cast(prev_state['stoch'])
+    prev_action = self._cast(prev_action)
+    if self._discrete:
+      shape = prev_stoch.shape[:-2] + [self._stoch * self._discrete]
+      prev_stoch = tf.reshape(prev_stoch, shape)
+    x = tf.concat([prev_stoch, prev_action], -1)
+    x = self.get('deter_in', tfkl.Dense, self._hidden)(x)
+    x = self.get('deter_in_norm', NormLayer, self._norm)(x)
+    x = self._act(x)
+    deter = prev_state['deter']
+    x, deter = self.get('cell', GRUCell, self._deter, norm=True)(x, [deter])
+    # x, deter = self._cell(x, [deter])
+    deter = deter[0]  # Keras wraps the state in a list.
+    return deter
+
+  @tf.function
+  def prior_step(self, deter, teacher_forcing, sample=True):
+    x = deter
+
+    if self.img_mlp:
+      x = self.get('img_mlp_1', tfkl.Dense, self._hidden)(x)
+      x = self.get('img_mlp_1', NormLayer, self._norm)(x)
+      x = self._act(x)
+      x = self.get('img_mlp_2', tfkl.Dense, self._hidden)(x)
+      x = self.get('img_mlp_2', NormLayer, self._norm)(x)
+      x = self._act(x)
+
+    if self.ar_steps > 1:
+      ar_state = x # hidden state is initialized with the determ state
+      stoch_list = []
+      stats_list = []
+
+      for step in range(self.ar_steps):
+        # predict one chunk of stoch variables
+        x = self.get('ar_img_in', tfkl.Dense, self._hidden)(x)
+        x = self.get('ar_img_in_norm', NormLayer, self._norm)(x)
+        x = self._act(x)
+        stats = self._suff_stats_ensemble(x)
+        index = tf.random.uniform((), 0, self._ensemble, tf.int32)
+        stats = {k: v[index] for k, v in stats.items()}
+        dist = self.get_dist(stats)
+        stoch = dist.sample() if sample else dist.mode()
+
+        # while each step predicts the full dist, only keep the chunk
+        start = step * self.stoch_per_step
+        trunc_stoch = stoch[:, start:start + self.stoch_per_step]
+        trunc_stats = {k: v[:, start:start + self.stoch_per_step] for k, v in stats.items()}
+        stoch_list.append(trunc_stoch)
+        stats_list.append(trunc_stats)
+
+        # if we are training, then set the input to the input, otherwise use samples
+        if teacher_forcing is None:
+          next_inp = trunc_stoch
+        else:
+          next_inp = teacher_forcing[:, start:start + self.stoch_per_step]
+
+        if self._discrete:
+          shape = next_inp.shape[:-2] + [self.stoch_per_step * self._discrete]
+          next_inp = tf.reshape(next_inp, shape)
+
+        # process the input samples and feed into the ar_cell gru
+        x = self.get('ar_img_sample_in', tfkl.Dense, self._hidden)(next_inp)
+        x = self.get('ar_img_sample_in_norm', NormLayer, self._norm)(x)
+        x = self._act(x)
+        x, ar_state = self.get('ar_cell', GRUCell, self._deter, norm=True)(x, [ar_state])
+        # x, ar_state = self._ar_cell(x, [ar_state])
+        ar_state = ar_state[0]
+
+      # concatenate chunks from the auto-regressive prediction
+      cat_stoch = tf.concat(stoch_list, 1)
+      cat_stats = {k: tf.concat([s[k] for s in stats_list], 1) for k, v in stats.items()}
+      prior = {'stoch': cat_stoch, 'deter': deter, **cat_stats}
+    else:
+      stats = self._suff_stats_ensemble(x)
+      index = tf.random.uniform((), 0, self._ensemble, tf.int32)
+      stats = {k: v[index] for k, v in stats.items()}
+      dist = self.get_dist(stats)
+      stoch = dist.sample() if sample else dist.mode()
+      prior = {'stoch': stoch, 'deter': deter, **stats}
+    return prior
+
+  @tf.function
+  def obs_step(self, prev_state, prev_action, embed, is_first, teacher_forcing, sample=True, 
+               training=False):
     # if is_first.any():
     prev_state, prev_action = tf.nest.map_structure(
         lambda x: tf.einsum(
             'b,b...->b...', 1.0 - is_first.astype(x.dtype), x),
         (prev_state, prev_action))
-    prior = self.img_step(prev_state, prev_action, sample)
+    prior = self.img_step(prev_state, prev_action, sample, teacher_forcing)
     x = tf.concat([prior['deter'], embed], -1)
     x = self.get('obs_out', tfkl.Dense, self._hidden)(x)
     x = self.get('obs_out_norm', NormLayer, self._obs_out_norm)(x, training=training)
@@ -106,25 +240,9 @@ class EnsembleRSSM(common.Module):
     return post, prior
 
   @tf.function
-  def img_step(self, prev_state, prev_action, sample=True):
-    prev_stoch = self._cast(prev_state['stoch'])
-    prev_action = self._cast(prev_action)
-    if self._discrete:
-      shape = prev_stoch.shape[:-2] + [self._stoch * self._discrete]
-      prev_stoch = tf.reshape(prev_stoch, shape)
-    x = tf.concat([prev_stoch, prev_action], -1)
-    x = self.get('img_in', tfkl.Dense, self._hidden)(x)
-    x = self.get('img_in_norm', NormLayer, self._norm)(x)
-    x = self._act(x)
-    deter = prev_state['deter']
-    x, deter = self._cell(x, [deter])
-    deter = deter[0]  # Keras wraps the state in a list.
-    stats = self._suff_stats_ensemble(x)
-    index = tf.random.uniform((), 0, self._ensemble, tf.int32)
-    stats = {k: v[index] for k, v in stats.items()}
-    dist = self.get_dist(stats)
-    stoch = dist.sample() if sample else dist.mode()
-    prior = {'stoch': stoch, 'deter': deter, **stats}
+  def img_step(self, prev_state, prev_action, sample=True, teacher_forcing=None):
+    deter = self.deter_update(prev_state, prev_action)
+    prior = self.prior_step(deter, teacher_forcing, sample)
     return prior
 
   def _suff_stats_ensemble(self, inp):
@@ -200,7 +318,7 @@ class Encoder(common.Module):
     self._mlp_layers = mlp_layers
 
   @tf.function
-  def __call__(self, data, training=True):
+  def __call__(self, data, training=False):
     key, shape = list(self.shapes.items())[0]
     batch_dims = data[key].shape[:-len(shape)]
     data = {
@@ -214,7 +332,7 @@ class Encoder(common.Module):
     output = tf.concat(outputs, -1)
     return output.reshape(batch_dims + output.shape[1:])
 
-  def _cnn(self, data, training=True):
+  def _cnn(self, data, training=False):
     x = tf.concat(list(data.values()), -1)
     x = x.astype(prec.global_policy().compute_dtype)
     for i, kernel in enumerate(self._cnn_kernels):
@@ -224,7 +342,7 @@ class Encoder(common.Module):
       x = self._act(x)
     return x.reshape(tuple(x.shape[:-3]) + (-1,))
 
-  def _mlp(self, data, training=True):
+  def _mlp(self, data, training=False):
     x = tf.concat(list(data.values()), -1)
     x = x.astype(prec.global_policy().compute_dtype)
     for i, width in enumerate(self._mlp_layers):
@@ -397,13 +515,13 @@ class NormLayer(common.Module):
     if name == 'none':
       self._layer = None
     elif name == 'layer':
-      self._layer = tfkl.LayerNormalization()
+      self._layer = tfkl.LayerNormalization(scale=True)
     elif name == 'batch':
       self._layer = tfkl.BatchNormalization()
     else:
       raise NotImplementedError(name)
 
-  def __call__(self, features, training=True):
+  def __call__(self, features, training=False):
     if not self._layer:
       return features
     if self._layer_name == 'batch':

@@ -1,0 +1,17 @@
+name: blast_ar_tuning
+entity: model-pretraining
+project: blast
+command: python dreamerv2/train.py --configs defaults atari only_kl
+with_bn:
+  task: 
+    values: ['atari_breakout', 'atari_seaquest', 'atari_qbert']
+  override_file:
+    yaml:
+      seed: 
+        values: [1, 2]
+      rssm.ar_steps: 
+        values: [1, 4, 8]
+      use_target_encoder: True
+      use_target_rssm: False
+      rssm.stoch: 8
+      rssm.discrete: 64

@@ -34,6 +34,8 @@ def get_id_storage_path(log_dir: str) -> str:
 
 def main():
 
+  agnt = None
+
   configs = yaml.safe_load((
       pathlib.Path(sys.argv[0]).parent / 'configs.yaml').read_text())
   parsed, remaining = common.Flags(configs=['defaults']).parse(known_only=True)
@@ -125,6 +127,37 @@ def main():
       reward = bool(['noreward', 'reward'].index(task)) or mode == 'eval'
       env = common.Crafter(outdir, reward)
       env = common.OneHotAction(env)
+    elif suite == 'minigrid-repeat':
+      env = common.MiniGridEnv(task, config.image_size)
+      env = common.GymWrapper(env)
+      env = common.TimeLimit(env, 100)
+      env = common.OneHotAction(env)
+    elif suite == 'minigrid-repeat-random-video':
+      env = common.MiniGridVideoDistractionEnv(
+        task, 
+        config.image_size, 
+        common.ALL_VIDEOS)
+      env = common.GymWrapper(env)
+      env = common.TimeLimit(env, 100)
+      env = common.OneHotAction(env)
+    elif suite == 'minigrid-repeat-fixed-video':
+      env = common.MiniGridVideoDistractionEnv(
+        task, 
+        config.image_size,
+        common.FIXED_VIDEO, 
+        play_mode='play')
+      env = common.GymWrapper(env)
+      env = common.TimeLimit(env, 100)
+      env = common.OneHotAction(env)
+    elif suite == 'minigrid-repeat-fixed-video-random':
+      env = common.MiniGridVideoDistractionEnv(
+        task, 
+        config.image_size,
+        common.FIXED_VIDEO, 
+        play_mode='random')
+      env = common.GymWrapper(env)
+      env = common.TimeLimit(env, 100)
+      env = common.OneHotAction(env)
     else:
       raise NotImplementedError(suite)
     env = common.TimeLimit(env, config.time_limit)
@@ -150,6 +183,8 @@ def main():
     replay = dict(train=train_replay, eval=eval_replay)[mode]
     logger.add(replay.stats, prefix=mode)
     logger.write()
+    if agnt is not None:
+      agnt.save(logdir / 'variables.pkl')
 
   print('Create envs.')
   num_eval_envs = min(config.envs, config.eval_eps)
